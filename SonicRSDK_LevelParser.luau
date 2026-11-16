@@ -3926,6 +3926,19 @@ function ccwHex(angleByte)
 	return (256 - (math.floor(angleByte + 0.5) % 256)) % 256
 end
 
+function pushModeFromAngleByte(angleByte)
+	local angle = ccwHex(angleByte)
+	if angle >= 225 or angle <= 31 then
+		return MODE_FLOOR
+	elseif angle <= 96 then
+		return MODE_RIGHT_WALL
+	elseif angle <= 159 then
+		return MODE_CEILING
+	else
+		return MODE_LEFT_WALL
+	end
+end
+
 function modeFromAngleByte(angleByte)
 	-- Convert RSDK's clockwise screen-space byte into the guide's
 	-- counter-clockwise angle before selecting the sensor orientation.
@@ -3967,8 +3980,9 @@ end
 -- A and B are at (+/- WidthRadius, HeightRadius) in local player space.
 -- Rotating d/u maps them onto the correct wall/roof positions.
 function groundSensorHit(mode, side, kind, maxIn, maxOut)
-	local d = MODE_D[mode]
-	local u = MODE_U[mode]
+	local pushMode = pushModeFromAngleByte(groundAngle256)
+	local d = MODE_D[pushMode]
+	local u = MODE_U[pushMode]
 	local sx = playerX + d[1] * HEIGHT_RADIUS + u[1] * WIDTH_RADIUS * side
 	local sy = playerY + d[2] * HEIGHT_RADIUS + u[2] * WIDTH_RADIUS * side
 	local distance, solidX, solidY = senseLevel(sx, sy, d[1], d[2], kind, maxIn, maxOut)
@@ -3980,13 +3994,11 @@ function groundSensorHit(mode, side, kind, maxIn, maxOut)
 		solidY + (d[2] < 0 and 1 or 0)
 end
 
--- Native tile-angle bytes are authoritative. Some exporters store the same
--- directional byte with the opposite tangent orientation, so resolve only
--- that 180-degree ambiguity by checking the mode and the A-to-B sensor chord.
--- The angle magnitude still comes from TileConfigData, not a guessed slope.
 function resolveNativeSurfaceAngle(mode, angleByte, hitAX, hitAY, hitBX, hitBY)
-	-- Native CollisionMask angles are authoritative. The sensor chord is only
-	-- needed when an exporter omits a usable native angle.
+	-- Native CollisionMask angles provide the slope, but some exporters store
+	-- the same tangent with its direction reversed by 180 degrees. Keep the
+	-- native angle's slope while choosing the direction that agrees with the
+	-- A-to-B sensor chord (positive Ground Speed direction).
 	local geometricAngle
 	if hitAX ~= nil and hitBX ~= nil then
 		local vx = hitBX - hitAX
@@ -3997,11 +4009,26 @@ function resolveNativeSurfaceAngle(mode, angleByte, hitAX, hitAY, hitBX, hitBY)
 	end
 
 	if angleByte ~= nil then
-		return normalizeAngle((angleByte % 256) * (2 * math.pi / 256))
+		local nativeAngle = normalizeAngle((angleByte % 256) * (2 * math.pi / 256))
+		local referenceAngle = geometricAngle or MODE_BASE[mode] or groundAngleRad
+		local reversedAngle = normalizeAngle(nativeAngle + math.pi)
+
+		-- The two byte values describe the same physical line, but the wrong
+		-- tangent direction reverses downhill gravity and sends movement into
+		-- the wrong collision sensors. Resolve that ambiguity consistently.
+		if referenceAngle ~= nil
+			and angleDistance(reversedAngle, referenceAngle) < angleDistance(nativeAngle, referenceAngle) then
+			nativeAngle = reversedAngle
+		end
+		return nativeAngle
 	end
 	return geometricAngle or groundAngleRad or MODE_BASE[mode]
 end
 
+
+-- Replace the existing measureGroundSurface() with this version.
+-- It keeps the normal left/right probes fast, then performs a one-pixel sweep
+-- across Sonic's foot width whenever those probes are not near a contact.
 function measureGroundSurface(mode, minDistance, maxDistance, maxIn, maxOut)
 	local kind = modeCollisionKind(mode)
 	local distA, solidAX, solidAY, contactAX, contactAY = groundSensorHit(mode, -1, kind, maxIn, maxOut)
@@ -4010,6 +4037,11 @@ function measureGroundSurface(mode, minDistance, maxDistance, maxIn, maxOut)
 	local validA = distA ~= nil and distA >= minDistance and distA <= maxDistance
 	local validB = distB ~= nil and distB >= minDistance and distB <= maxDistance
 	local bestDist, bestSolidX, bestSolidY
+	local angleContactAX = validA and contactAX or nil
+	local angleContactAY = validA and contactAY or nil
+	local angleContactBX = validB and contactBX or nil
+	local angleContactBY = validB and contactBY or nil
+
 	if validA and validB then
 		if distA <= distB then
 			bestDist, bestSolidX, bestSolidY = distA, solidAX, solidAY
@@ -4020,14 +4052,40 @@ function measureGroundSurface(mode, minDistance, maxDistance, maxIn, maxOut)
 		bestDist, bestSolidX, bestSolidY = distA, solidAX, solidAY
 	elseif validB then
 		bestDist, bestSolidX, bestSolidY = distB, solidBX, solidBY
-	else
-		-- Centre fallback only bridges a gap when both primary sensors miss.
-		local centerDist, centerSolidX, centerSolidY = groundSensorHit(mode, 0, kind, maxIn, maxOut)
-		if centerDist ~= nil and centerDist >= minDistance and centerDist <= maxDistance then
-			bestDist, bestSolidX, bestSolidY = centerDist, centerSolidX, centerSolidY
-		else
-			return nil
+	end
+
+	-- A/B only cover the two outer foot columns. A thin collision pixel can
+	-- sit between them, so sweep every interior pixel column when the outer
+	-- sensors miss or are more than half a pixel away from a secure contact.
+	-- The offsets are in local surface space, so this also works on walls and
+	-- ceilings without changing the existing sensor orientation.
+	if bestDist == nil or math.abs(bestDist) > 0.5 then
+		for pixelOffset = -WIDTH_RADIUS + 1, WIDTH_RADIUS - 1 do
+			local distance, solidX, solidY, contactX, contactY = groundSensorHit(
+				mode,
+				pixelOffset / WIDTH_RADIUS,
+				kind,
+				maxIn,
+				maxOut
+			)
+			if distance ~= nil and distance >= minDistance and distance <= maxDistance then
+				if bestDist == nil or distance < bestDist then
+					bestDist, bestSolidX, bestSolidY = distance, solidX, solidY
+				end
+
+				-- Keep the widest available contact chord for the geometric-angle
+				-- fallback used by exporters without a native surface angle.
+				if pixelOffset < 0 and angleContactAX == nil then
+					angleContactAX, angleContactAY = contactX, contactY
+				elseif pixelOffset > 0 then
+					angleContactBX, angleContactBY = contactX, contactY
+				end
+			end
 		end
+	end
+
+	if bestDist == nil then
+		return nil
 	end
 
 	local nativeAngleByte = RSDKLevelParser.GetSurfaceAngleAtPixel(
@@ -4041,13 +4099,14 @@ function measureGroundSurface(mode, minDistance, maxDistance, maxIn, maxOut)
 	local angle = resolveNativeSurfaceAngle(
 		mode,
 		nativeAngleByte,
-		validA and contactAX or nil,
-		validA and contactAY or nil,
-		validB and contactBX or nil,
-		validB and contactBY or nil
+		angleContactAX,
+		angleContactAY,
+		angleContactBX,
+		angleContactBY
 	)
 	return bestDist, bestSolidX, bestSolidY, angle
 end
+
 
 function applyGroundContact(mode, distance, angle)
 	local d = MODE_D[mode]
